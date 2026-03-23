@@ -58,6 +58,35 @@ MODEL_CLASSES = {
 }
 
 
+def sync_gradients_gather_scatter(model, world_size):
+    """Task 2a: Gradient sync using gather and scatter via rank 0."""
+    for param in model.parameters():
+        if param.grad is None:
+            continue
+        grad = param.grad.data
+        if torch.distributed.get_rank() == 0:
+            gather_list = [torch.zeros_like(grad) for _ in range(world_size)]
+        else:
+            gather_list = None
+        torch.distributed.gather(grad, gather_list, dst=0)
+        if torch.distributed.get_rank() == 0:
+            avg_grad = torch.stack(gather_list).mean(dim=0)
+            scatter_list = [avg_grad.clone() for _ in range(world_size)]
+        else:
+            scatter_list = None
+        torch.distributed.scatter(grad, scatter_list, src=0)
+        param.grad.data = grad
+
+
+def sync_gradients_all_reduce(model, world_size):
+    """Task 2b: Gradient sync using all_reduce."""
+    for param in model.parameters():
+        if param.grad is None:
+            continue
+        torch.distributed.all_reduce(param.grad.data, op=torch.distributed.ReduceOp.SUM)
+        param.grad.data /= world_size
+
+
 def set_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -71,7 +100,10 @@ def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
     args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = RandomSampler(train_dataset)
+    if args.local_rank != -1:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.local_rank)
+    else:
+        train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -134,6 +166,11 @@ def train(args, train_dataset, model, tokenizer):
                 # TODO(cos568): perform backward pass here (expect one line of code)
                 loss.backward()
                 ##################################################
+                # Gradient synchronization for distributed training
+                if args.local_rank != -1 and args.comm_method == "gather_scatter":
+                    sync_gradients_gather_scatter(model, args.world_size)
+                elif args.local_rank != -1 and args.comm_method == "all_reduce":
+                    sync_gradients_all_reduce(model, args.world_size)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
@@ -350,12 +387,35 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+    parser.add_argument("--master_ip", type=str, default="127.0.0.1",
+                        help="Master node IP address for distributed training.")
+    parser.add_argument("--master_port", type=str, default="12345",
+                        help="Master node port for distributed training.")
+    parser.add_argument("--world_size", type=int, default=1,
+                        help="Number of nodes for distributed training.")
+    parser.add_argument("--comm_method", type=str, default="gather_scatter",
+                        choices=["gather_scatter", "all_reduce", "ddp"],
+                        help="Communication method for gradient synchronization.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
     # set up (distributed) training
+    if args.local_rank != -1:
+        # Auto-detect the network interface with 10.10.1.* IP for CloudLab
+        import subprocess
+        try:
+            iface = subprocess.check_output("ip -o addr show | grep '10.10.1'", shell=True).decode().split()[1]
+            os.environ['GLOO_SOCKET_IFNAME'] = iface
+        except Exception:
+            pass  # Fall back to default interface
+        torch.distributed.init_process_group(
+            backend='gloo',
+            init_method=f"tcp://{args.master_ip}:{args.master_port}",
+            world_size=args.world_size,
+            rank=args.local_rank,
+        )
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
 
@@ -397,6 +457,10 @@ def main():
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     model.to(args.device)
+
+    # Task 3: Wrap model with DDP for automatic gradient synchronization
+    if args.local_rank != -1 and args.comm_method == "ddp":
+        model = torch.nn.parallel.DistributedDataParallel(model)
 
     logger.info("Training/evaluation parameters %s", args)
 
