@@ -22,6 +22,7 @@ import glob
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -142,9 +143,29 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+
+    # Task 4: Set up profiler if --profile is enabled
+    # Skip 1st step (warmup), profile the next 3 steps
+    if args.profile:
+        prof_schedule = torch.profiler.schedule(wait=0, warmup=1, active=3, repeat=1)
+        rank = args.local_rank if args.local_rank != -1 else 0
+        trace_path = os.path.join(args.output_dir, f"trace_rank{rank}_{args.comm_method}.json")
+        def trace_handler(prof):
+            prof.export_chrome_trace(trace_path)
+            logger.info("Saved profiling trace to %s", trace_path)
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            schedule=prof_schedule,
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+            with_stack=True,
+        )
+        profiler.start()
+
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
+            step_start_time = time.time()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
@@ -174,8 +195,9 @@ def train(args, train_dataset, model, tokenizer):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
-            if step < 5:
-                print(f"Step {step}, Loss: {loss.item()}")
+            step_end_time = time.time()
+            step_time = step_end_time - step_start_time
+            print(f"Step {step}, Loss: {loss.item():.6f}, Time: {step_time:.3f}s")
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
@@ -185,17 +207,28 @@ def train(args, train_dataset, model, tokenizer):
                 model.zero_grad()
                 global_step += 1
 
+            if args.profile:
+                profiler.step()
+                # Stop after 4 steps (1 warmup + 3 active)
+                if step >= 3:
+                    break
+
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
+        if args.profile:
+            break
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
-        
+
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
         evaluate(args, model, tokenizer)
         ##################################################
+
+    if args.profile:
+        profiler.stop()
 
     return global_step, tr_loss / global_step
 
@@ -396,6 +429,8 @@ def main():
     parser.add_argument("--comm_method", type=str, default="gather_scatter",
                         choices=["gather_scatter", "all_reduce", "ddp"],
                         help="Communication method for gradient synchronization.")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling: skip 1st step, profile 3 steps, save chrome trace.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
